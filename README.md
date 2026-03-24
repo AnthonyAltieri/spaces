@@ -122,6 +122,23 @@ List from a custom base directory:
 spaces list --base-dir /tmp/spaces-home --json
 ```
 
+### Add
+
+Add new repos into an existing workspace using that workspace's branch name:
+
+```bash
+spaces add spring-rollout ~/code/new-repo
+```
+
+Add multiple repos into a workspace stored under a custom base directory:
+
+```bash
+spaces add spring-rollout \
+  --base-dir /tmp/spaces-home \
+  ~/code/new-repo \
+  ~/code/another-repo
+```
+
 ### Show
 
 Inspect one workspace:
@@ -202,10 +219,12 @@ Every command supports `--json`. Human-readable debug-style output is useful for
 
 ## Operational Notes
 
+- `add` creates new child worktrees inside an existing workspace directory and updates the recorded repo list
 - `list`, `show`, and `remove` all support `--base-dir`, not just `create`
 - `ls` is an alias for `list`
 - JSON output is the default for all commands
 - `spaces -i <dir>` inspects only the immediate child directories under `<dir>` when `<dir>` is not itself a repo and then opens a filtered checkbox picker in the terminal
+- `add` uses the existing workspace branch name and validates new repos against the current child directory names in that workspace
 - duplicate repo paths are deduplicated by canonical repo root
 - repos with the same basename are rejected because each repo gets its own directory under the workspace
 - `show` and `list` surface stale state if worktrees or workspace directories are missing on disk

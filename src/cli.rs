@@ -1,6 +1,6 @@
 use crate::app::{
-    default_base_dir, prompt_for_branch_action, CreateWorkspaceRequest, RemoveBranchAction,
-    RemoveWorkspaceRequest, WorkspaceManager,
+    default_base_dir, prompt_for_branch_action, AddWorkspaceReposRequest, CreateWorkspaceRequest,
+    RemoveBranchAction, RemoveWorkspaceRequest, WorkspaceManager,
 };
 use crate::git;
 use crate::repo_picker::{prompt_for_repo_selection as run_repo_picker, RepoPromptOption};
@@ -28,6 +28,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Create(CreateArgs),
+    Add(AddArgs),
     #[command(alias = "ls")]
     List(ListArgs),
     Show(ShowArgs),
@@ -56,6 +57,17 @@ struct ListArgs {
     base_dir: Option<PathBuf>,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AddArgs {
+    workspace: String,
+    #[arg(long)]
+    base_dir: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+    #[arg(required = true)]
+    repos: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +139,15 @@ where
 
     match cli.command {
         Some(Commands::Create(args)) => run_create(args, output, repo_selector),
+        Some(Commands::Add(args)) => {
+            let manager = WorkspaceManager::new(args.base_dir.unwrap_or(default_base_dir()?));
+            let result = manager.add(AddWorkspaceReposRequest {
+                workspace_name: args.workspace,
+                repo_paths: args.repos,
+            })?;
+            let _ = args.json;
+            render(output, true, &result)
+        }
         Some(Commands::List(args)) => {
             let manager = WorkspaceManager::new(args.base_dir.unwrap_or(default_base_dir()?));
             let result = manager.list()?;
@@ -339,6 +360,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{run_from, run_from_with_selector};
+    use crate::app::{CreateWorkspaceRequest, WorkspaceManager};
     use crate::registry::{Registry, RegistryStore, WorkspaceRecord};
     use anyhow::Context;
     use anyhow::Result;
@@ -526,6 +548,49 @@ mod tests {
 
         let value: Value = serde_json::from_slice(&output)?;
         assert_eq!(value["workspace_name"], "steady-trail");
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_subcommand_updates_an_existing_workspace() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let repo_one = init_repo(temp.path(), "alpha")?;
+        let repo_two = init_repo(temp.path(), "beta")?;
+        let manager = WorkspaceManager::new(base_dir.clone());
+
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one],
+        })?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "add",
+                "steady-trail",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+                repo_two.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let value: Value = serde_json::from_slice(&output)?;
+        assert_eq!(value["workspace_name"], "steady-trail");
+        assert_eq!(
+            value["added_repos"]
+                .as_array()
+                .expect("added repos array")
+                .len(),
+            1
+        );
+        assert_eq!(value["repos"].as_array().expect("repos array").len(), 2);
 
         Ok(())
     }
