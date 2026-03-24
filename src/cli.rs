@@ -3,24 +3,26 @@ use crate::app::{
     RemoveWorkspaceRequest, WorkspaceManager,
 };
 use crate::git;
+use crate::repo_picker::{prompt_for_repo_selection as run_repo_picker, RepoPromptOption};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use inquire::{InquireError, MultiSelect};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 #[derive(Debug, Parser)]
 #[command(name = "spaces")]
 #[command(about = "Create and manage coordinated multi-repo git workspaces")]
+#[command(args_conflicts_with_subcommands = true)]
+#[command(subcommand_negates_reqs = true)]
 struct Cli {
+    #[command(flatten)]
+    create: CreateArgs,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -34,6 +36,8 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct CreateArgs {
+    #[arg(short = 'i', long)]
+    interactive: bool,
     #[arg(long)]
     name: Option<String>,
     #[arg(long)]
@@ -99,18 +103,6 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RepoPromptOption {
-    label: String,
-    repo_root: PathBuf,
-}
-
-impl fmt::Display for RepoPromptOption {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.label)
-    }
-}
-
 pub fn run_from<I, T>(args: I, input: &mut dyn BufRead, output: &mut dyn Write) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -134,28 +126,20 @@ where
     let cli = Cli::parse_from(args);
 
     match cli.command {
-        Commands::Create(args) => {
-            let repo_paths = resolve_create_repo_paths(&args, repo_selector)?;
-            let base_dir = args.base_dir.unwrap_or(default_base_dir()?);
-            let manager = WorkspaceManager::new(base_dir);
-            let result = manager.create(CreateWorkspaceRequest {
-                workspace_name: args.name,
-                branch_name: args.branch,
-                repo_paths,
-            })?;
-            render(output, args.json, &result)
-        }
-        Commands::List(args) => {
+        Some(Commands::Create(args)) => run_create(args, output, repo_selector),
+        Some(Commands::List(args)) => {
             let manager = WorkspaceManager::new(args.base_dir.unwrap_or(default_base_dir()?));
             let result = manager.list()?;
-            render(output, args.json, &result)
+            let _ = args.json;
+            render(output, true, &result)
         }
-        Commands::Show(args) => {
+        Some(Commands::Show(args)) => {
             let manager = WorkspaceManager::new(args.base_dir.unwrap_or(default_base_dir()?));
             let result = manager.show(&args.workspace)?;
-            render(output, args.json, &result)
+            let _ = args.json;
+            render(output, true, &result)
         }
-        Commands::Remove(args) => {
+        Some(Commands::Remove(args)) => {
             let base_dir = args.base_dir.clone().unwrap_or(default_base_dir()?);
             let manager = WorkspaceManager::new(base_dir);
             let branch_action = resolve_branch_action(&args, input, output)?;
@@ -163,8 +147,10 @@ where
                 workspace_name: args.workspace,
                 branch_action,
             })?;
-            render(output, args.json, &result)
+            let _ = args.json;
+            render(output, true, &result)
         }
+        None => run_create(cli.create, output, repo_selector),
     }
 }
 
@@ -172,13 +158,17 @@ fn resolve_create_repo_paths<S>(args: &CreateArgs, repo_selector: &mut S) -> Res
 where
     S: RepoSelector,
 {
-    if args.repos.len() != 1 {
+    if !args.interactive {
         return Ok(args.repos.clone());
+    }
+
+    if args.repos.len() != 1 {
+        bail!("interactive repo selection requires exactly one directory path");
     }
 
     let requested_path = &args.repos[0];
     let Some(discovery_root) = resolve_discovery_root(requested_path)? else {
-        return Ok(args.repos.clone());
+        bail!("interactive repo selection requires a non-repository directory path");
     };
 
     let repo_roots = discover_repo_roots(&discovery_root)?;
@@ -195,6 +185,22 @@ where
     }
 
     Ok(selected)
+}
+
+fn run_create<S>(args: CreateArgs, output: &mut dyn Write, repo_selector: &mut S) -> Result<()>
+where
+    S: RepoSelector,
+{
+    let repo_paths = resolve_create_repo_paths(&args, repo_selector)?;
+    let base_dir = args.base_dir.unwrap_or(default_base_dir()?);
+    let manager = WorkspaceManager::new(base_dir);
+    let result = manager.create(CreateWorkspaceRequest {
+        workspace_name: args.name,
+        branch_name: args.branch,
+        repo_paths,
+    })?;
+    let _ = args.json;
+    render(output, true, &result)
 }
 
 fn resolve_discovery_root(path: &Path) -> Result<Option<PathBuf>> {
@@ -214,27 +220,24 @@ fn resolve_discovery_root(path: &Path) -> Result<Option<PathBuf>> {
 fn discover_repo_roots(discovery_root: &Path) -> Result<Vec<PathBuf>> {
     let mut repo_roots = Vec::new();
     let mut seen = HashSet::new();
-    let mut walker = WalkDir::new(discovery_root).follow_links(false).into_iter();
 
-    while let Some(entry) = walker.next() {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to inspect directory tree under {}",
-                discovery_root.display()
-            )
-        })?;
-
-        if !entry.file_type().is_dir() {
-            continue;
-        }
-
-        if entry.file_name() == ".git" {
-            walker.skip_current_dir();
+    for entry in fs::read_dir(discovery_root).with_context(|| {
+        format!(
+            "failed to inspect immediate child directories under {}",
+            discovery_root.display()
+        )
+    })? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
             continue;
         }
 
         let path = entry.path();
-        let Some(repo_root) = git::repo_root_if_repo(path)? else {
+        if !contains_git_dir(&path)? {
+            continue;
+        }
+
+        let Some(repo_root) = git::repo_root_if_repo(&path)? else {
             continue;
         };
 
@@ -248,12 +251,21 @@ fn discover_repo_roots(discovery_root: &Path) -> Result<Vec<PathBuf>> {
         if seen.insert(repo_root.clone()) {
             repo_roots.push(repo_root);
         }
-
-        walker.skip_current_dir();
     }
 
     repo_roots.sort();
     Ok(repo_roots)
+}
+
+fn contains_git_dir(path: &Path) -> Result<bool> {
+    let git_path = path.join(".git");
+    match fs::symlink_metadata(&git_path) {
+        Ok(metadata) => Ok(metadata.is_dir() || metadata.file_type().is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {}", git_path.display()))
+        }
+    }
 }
 
 fn prompt_for_repo_selection(
@@ -269,15 +281,7 @@ fn prompt_for_repo_selection(
         .map(|repo_root| build_repo_prompt_option(discovery_root, repo_root))
         .collect::<Result<Vec<_>>>()?;
 
-    let selected = MultiSelect::new("Select repositories for the workspace", options)
-        .with_page_size(12)
-        .prompt()
-        .map_err(map_prompt_error)?;
-
-    Ok(selected
-        .into_iter()
-        .map(|option| option.repo_root)
-        .collect())
+    run_repo_picker(options)
 }
 
 fn build_repo_prompt_option(discovery_root: &Path, repo_root: &Path) -> Result<RepoPromptOption> {
@@ -296,15 +300,6 @@ fn build_repo_prompt_option(discovery_root: &Path, repo_root: &Path) -> Result<R
         label,
         repo_root: repo_root.to_path_buf(),
     })
-}
-
-fn map_prompt_error(error: InquireError) -> anyhow::Error {
-    match error {
-        InquireError::OperationCanceled | InquireError::OperationInterrupted => {
-            anyhow::anyhow!("interactive repo selection was canceled")
-        }
-        other => other.into(),
-    }
 }
 
 fn resolve_branch_action(
@@ -377,7 +372,6 @@ mod tests {
                 "list",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
-                "--json",
             ],
             &mut input,
             &mut output,
@@ -414,7 +408,6 @@ mod tests {
                 "ls",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
-                "--json",
             ],
             &mut input,
             &mut output,
@@ -454,7 +447,6 @@ mod tests {
                 "steady-trail",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
-                "--json",
             ],
             &mut input,
             &mut output,
@@ -483,12 +475,10 @@ mod tests {
         run_from(
             [
                 "spaces",
-                "create",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
                 "--name",
                 "rapid-signal",
-                "--json",
                 repo_path.to_str().expect("utf-8 path"),
             ],
             &mut input,
@@ -513,14 +503,42 @@ mod tests {
     }
 
     #[test]
+    fn create_subcommand_remains_supported() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let repo_path = init_repo(temp.path(), "alpha")?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "create",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+                "--name",
+                "steady-trail",
+                repo_path.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let value: Value = serde_json::from_slice(&output)?;
+        assert_eq!(value["workspace_name"], "steady-trail");
+
+        Ok(())
+    }
+
+    #[test]
     fn create_directory_mode_uses_discovered_repos() -> Result<()> {
         let temp = tempdir()?;
         let base_dir = temp.path().join("spaces-home");
         let discovery_root = temp.path().join("repos");
-        fs::create_dir_all(discovery_root.join("clients"))?;
+        fs::create_dir_all(&discovery_root)?;
         let discovery_root = fs::canonicalize(&discovery_root)?;
         let repo_one = fs::canonicalize(init_repo(&discovery_root, "alpha")?)?;
-        let repo_two = fs::canonicalize(init_repo(&discovery_root.join("clients"), "beta")?)?;
+        let repo_two = fs::canonicalize(init_repo(&discovery_root, "beta")?)?;
 
         let expected = vec![repo_one.clone(), repo_two.clone()];
         let mut selector_called = false;
@@ -536,12 +554,11 @@ mod tests {
         run_from_with_selector(
             [
                 "spaces",
-                "create",
+                "-i",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
                 "--name",
                 "rapid-signal",
-                "--json",
                 discovery_root.to_str().expect("utf-8 path"),
             ],
             &mut input,
@@ -555,6 +572,21 @@ mod tests {
         let repos = value["repos"].as_array().expect("repos array");
         assert_eq!(repos.len(), 2);
         assert_eq!(value["workspace_name"], "rapid-signal");
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_directory_mode_ignores_nested_repositories() -> Result<()> {
+        let temp = tempdir()?;
+        let discovery_root = temp.path().join("repos");
+        fs::create_dir_all(discovery_root.join("clients"))?;
+        let discovery_root = fs::canonicalize(&discovery_root)?;
+        let repo_one = fs::canonicalize(init_repo(&discovery_root, "alpha")?)?;
+        init_repo(&discovery_root.join("clients"), "beta")?;
+
+        let discovered = super::discover_repo_roots(&discovery_root)?;
+        assert_eq!(discovered, vec![repo_one]);
 
         Ok(())
     }
@@ -574,7 +606,7 @@ mod tests {
         let error = run_from_with_selector(
             [
                 "spaces",
-                "create",
+                "-i",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
                 discovery_root.to_str().expect("utf-8 path"),
@@ -606,7 +638,7 @@ mod tests {
         let error = run_from_with_selector(
             [
                 "spaces",
-                "create",
+                "-i",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
                 discovery_root.to_str().expect("utf-8 path"),
@@ -638,12 +670,10 @@ mod tests {
         run_from_with_selector(
             [
                 "spaces",
-                "create",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
                 "--name",
                 "steady-trail",
-                "--json",
                 repo_path.to_str().expect("utf-8 path"),
             ],
             &mut input,
@@ -660,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn create_directory_mode_requires_a_terminal_for_real_prompt() -> Result<()> {
+    fn interactive_mode_requires_a_terminal_for_real_prompt() -> Result<()> {
         let temp = tempdir()?;
         let base_dir = temp.path().join("spaces-home");
         let discovery_root = temp.path().join("repos");
@@ -672,7 +702,7 @@ mod tests {
         let error = run_from(
             [
                 "spaces",
-                "create",
+                "-i",
                 "--base-dir",
                 base_dir.to_str().expect("utf-8 path"),
                 discovery_root.to_str().expect("utf-8 path"),
@@ -685,6 +715,41 @@ mod tests {
         assert!(error
             .to_string()
             .contains("interactive repo selection requires a terminal"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn directory_path_without_interactive_flag_bypasses_selector() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let discovery_root = temp.path().join("repos");
+        fs::create_dir_all(&discovery_root)?;
+        init_repo(&discovery_root, "alpha")?;
+
+        let mut selector_called = false;
+        let mut selector = |_: &Path, _: &[PathBuf]| -> Result<Vec<PathBuf>> {
+            selector_called = true;
+            Ok(Vec::new())
+        };
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let error = run_from_with_selector(
+            [
+                "spaces",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+                discovery_root.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+            &mut selector,
+        )
+        .expect_err("directory path should be treated as a repo path without -i");
+
+        assert!(!selector_called);
+        assert!(error.to_string().contains("failed to treat"));
 
         Ok(())
     }

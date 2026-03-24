@@ -3,6 +3,7 @@ pub mod cli;
 pub mod git;
 pub mod names;
 pub mod registry;
+pub mod repo_picker;
 
 use std::io::{self, BufReader};
 
