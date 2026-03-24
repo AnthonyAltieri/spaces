@@ -46,19 +46,19 @@ cargo build
 Run it directly with Cargo:
 
 ```bash
-cargo run -- create ~/code/dotfiles ~/code/firecrawl
+cargo run -- ~/code/dotfiles ~/code/firecrawl
 ```
 
 Use interactive discovery from a parent directory:
 
 ```bash
-cargo run -- create ~/code
+cargo run -- -i ~/code
 ```
 
 Or run the built binary:
 
 ```bash
-./target/debug/spaces create ~/code/dotfiles ~/code/firecrawl
+./target/debug/spaces ~/code/dotfiles ~/code/firecrawl
 ```
 
 Run tests:
@@ -74,13 +74,13 @@ cargo test
 Create a new coordinated workspace:
 
 ```bash
-spaces create ~/code/dotfiles ~/code/firecrawl
+spaces ~/code/dotfiles ~/code/firecrawl
 ```
 
 Use an explicit workspace name, branch name, and base directory:
 
 ```bash
-spaces create \
+spaces \
   --name spring-rollout \
   --branch spring-rollout \
   --base-dir /tmp/spaces-home \
@@ -88,19 +88,19 @@ spaces create \
   ~/code/firecrawl
 ```
 
-JSON output for automation:
+JSON output is the default:
 
 ```bash
-spaces create --json ~/code/dotfiles ~/code/firecrawl
+spaces ~/code/dotfiles ~/code/firecrawl
 ```
 
-If you pass a single directory that is not itself a Git repo, `create` recursively discovers repos under that directory and opens an interactive multi-select prompt. Type to filter, press `Space` to toggle repos, and `Enter` to continue with the selected set.
+If you want to discover repos from the immediate children of a parent directory, use `-i`. That opens the interactive `ratatui` picker with explicit checkboxes. Type to fuzzy filter, use the arrow keys to move, press `Space` to toggle repos, `Enter` to continue with the selected set, and `Esc` to cancel.
 
 ```bash
-spaces create ~/code
+spaces -i ~/code
 ```
 
-Directory mode requires a terminal. For non-interactive use, pass explicit repo paths instead.
+Interactive discovery requires a terminal. Without `-i`, a single path is treated as a normal repo path and produces a single-repo workspace.
 
 ### List
 
@@ -120,6 +120,23 @@ List from a custom base directory:
 
 ```bash
 spaces list --base-dir /tmp/spaces-home --json
+```
+
+### Add
+
+Add new repos into an existing workspace using that workspace's branch name:
+
+```bash
+spaces add spring-rollout ~/code/new-repo
+```
+
+Add multiple repos into a workspace stored under a custom base directory:
+
+```bash
+spaces add spring-rollout \
+  --base-dir /tmp/spaces-home \
+  ~/code/new-repo \
+  ~/code/another-repo
 ```
 
 ### Show
@@ -202,10 +219,12 @@ Every command supports `--json`. Human-readable debug-style output is useful for
 
 ## Operational Notes
 
+- `add` creates new child worktrees inside an existing workspace directory and updates the recorded repo list
 - `list`, `show`, and `remove` all support `--base-dir`, not just `create`
 - `ls` is an alias for `list`
-- `create --json` reports which source repos were auto-stashed
-- `create <dir>` recursively discovers repos under `<dir>` when `<dir>` is not itself a repo and then prompts for a filtered multi-select
+- JSON output is the default for all commands
+- `spaces -i <dir>` inspects only the immediate child directories under `<dir>` when `<dir>` is not itself a repo and then opens a filtered checkbox picker in the terminal
+- `add` uses the existing workspace branch name and validates new repos against the current child directory names in that workspace
 - duplicate repo paths are deduplicated by canonical repo root
 - repos with the same basename are rejected because each repo gets its own directory under the workspace
 - `show` and `list` surface stale state if worktrees or workspace directories are missing on disk

@@ -19,6 +19,12 @@ pub struct CreateWorkspaceRequest {
     pub repo_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AddWorkspaceReposRequest {
+    pub workspace_name: String,
+    pub repo_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoveBranchAction {
@@ -56,6 +62,17 @@ pub struct CreateWorkspaceResult {
     pub workspace_dir: PathBuf,
     pub registry_path: PathBuf,
     pub stashed_source_repos: Vec<StashedSourceRepoView>,
+    pub repos: Vec<WorkspaceRepoView>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AddWorkspaceReposResult {
+    pub workspace_name: String,
+    pub branch_name: String,
+    pub workspace_dir: PathBuf,
+    pub registry_path: PathBuf,
+    pub stashed_source_repos: Vec<StashedSourceRepoView>,
+    pub added_repos: Vec<WorkspaceRepoView>,
     pub repos: Vec<WorkspaceRepoView>,
 }
 
@@ -173,7 +190,7 @@ impl WorkspaceManager {
             );
         }
 
-        let mut repos = resolve_repos(&request.repo_paths, &branch_name, &workspace_dir)?;
+        let mut repos = resolve_repos(&request.repo_paths, &branch_name, &workspace_dir, &[])?;
         let stashed_repos = auto_stash_repos(&repos, &workspace_name)?;
 
         if let Err(error) = populate_base_commits(&mut repos) {
@@ -189,14 +206,21 @@ impl WorkspaceManager {
             return Err(rollback_auto_stashes(error, &stashed_repos));
         }
 
-        let created_record =
-            match self.create_worktrees(&workspace_name, &branch_name, &workspace_dir, repos) {
-                Ok(record) => record,
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&workspace_dir);
-                    return Err(rollback_auto_stashes(error, &stashed_repos));
-                }
-            };
+        let created_repos = match self.create_repo_records(&workspace_name, &branch_name, repos) {
+            Ok(created_repos) => created_repos,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&workspace_dir);
+                return Err(rollback_auto_stashes(error, &stashed_repos));
+            }
+        };
+
+        let created_record = WorkspaceRecord {
+            name: workspace_name.clone(),
+            branch_name: branch_name.clone(),
+            created_at_epoch_seconds: current_epoch_seconds()?,
+            workspace_dir: workspace_dir.clone(),
+            repos: created_repos,
+        };
 
         registry.upsert(created_record.clone());
         if let Err(error) = self.store.save(&registry) {
@@ -210,6 +234,60 @@ impl WorkspaceManager {
             &created_record,
             self.registry_path().to_path_buf(),
             &stashed_repos,
+        ))
+    }
+
+    pub fn add(&self, request: AddWorkspaceReposRequest) -> Result<AddWorkspaceReposResult> {
+        if request.repo_paths.is_empty() {
+            bail!("at least one repository path is required");
+        }
+
+        let mut registry = self.store.load()?;
+        let workspace = registry
+            .get(&request.workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("workspace `{}` was not found", request.workspace_name))?;
+
+        if !workspace.workspace_dir.exists() {
+            bail!(
+                "workspace directory is missing at {}",
+                workspace.workspace_dir.display()
+            );
+        }
+
+        let mut repos = resolve_repos(
+            &request.repo_paths,
+            &workspace.branch_name,
+            &workspace.workspace_dir,
+            &workspace.repos,
+        )?;
+        let stashed_repos = auto_stash_repos(&repos, &workspace.name)?;
+
+        if let Err(error) = populate_base_commits(&mut repos) {
+            return Err(rollback_auto_stashes(error, &stashed_repos));
+        }
+
+        let added_repos =
+            match self.create_repo_records(&workspace.name, &workspace.branch_name, repos) {
+                Ok(added_repos) => added_repos,
+                Err(error) => return Err(rollback_auto_stashes(error, &stashed_repos)),
+            };
+
+        let mut updated_workspace = workspace.clone();
+        updated_workspace.repos.extend(added_repos.clone());
+
+        registry.upsert(updated_workspace.clone());
+        if let Err(error) = self.store.save(&registry) {
+            rollback_workspace_creation(&added_repos, &workspace.branch_name);
+            let error = error.context("failed to persist registry after adding worktrees");
+            return Err(rollback_auto_stashes(error, &stashed_repos));
+        }
+
+        Ok(build_add_result(
+            &updated_workspace,
+            self.registry_path().to_path_buf(),
+            &stashed_repos,
+            &added_repos,
         ))
     }
 
@@ -330,13 +408,12 @@ impl WorkspaceManager {
         })
     }
 
-    fn create_worktrees(
+    fn create_repo_records(
         &self,
         workspace_name: &str,
         branch_name: &str,
-        workspace_dir: &Path,
         repos: Vec<ResolvedRepo>,
-    ) -> Result<WorkspaceRecord> {
+    ) -> Result<Vec<RepoRecord>> {
         let mut created = Vec::new();
 
         for repo in &repos {
@@ -353,23 +430,17 @@ impl WorkspaceManager {
             created.push((repo.repo_root.clone(), repo.worktree_path.clone()));
         }
 
-        Ok(WorkspaceRecord {
-            name: workspace_name.to_owned(),
-            branch_name: branch_name.to_owned(),
-            created_at_epoch_seconds: current_epoch_seconds()?,
-            workspace_dir: workspace_dir.to_path_buf(),
-            repos: repos
-                .into_iter()
-                .map(|repo| RepoRecord {
-                    repo_name: repo.repo_name,
-                    source_repo_path: repo.repo_root,
-                    worktree_path: repo.worktree_path,
-                    remote_name: DEFAULT_REMOTE.to_owned(),
-                    base_ref: "origin/main".to_owned(),
-                    base_commit: repo.base_commit,
-                })
-                .collect(),
-        })
+        Ok(repos
+            .into_iter()
+            .map(|repo| RepoRecord {
+                repo_name: repo.repo_name,
+                source_repo_path: repo.repo_root,
+                worktree_path: repo.worktree_path,
+                remote_name: DEFAULT_REMOTE.to_owned(),
+                base_ref: "origin/main".to_owned(),
+                base_commit: repo.base_commit,
+            })
+            .collect())
     }
 }
 
@@ -465,10 +536,18 @@ fn resolve_repos(
     requested_paths: &[PathBuf],
     branch_name: &str,
     workspace_dir: &Path,
+    existing_repos: &[RepoRecord],
 ) -> Result<Vec<ResolvedRepo>> {
+    let existing_roots = existing_repos
+        .iter()
+        .map(|repo| repo.source_repo_path.clone())
+        .collect::<HashSet<_>>();
     let mut seen_roots = HashSet::new();
     let mut repos = Vec::new();
-    let mut seen_repo_names = HashSet::new();
+    let mut seen_repo_names = existing_repos
+        .iter()
+        .map(|repo| repo.repo_name.clone())
+        .collect::<HashSet<_>>();
 
     for requested_path in requested_paths {
         let repo_root = git::resolve_repo_root(requested_path).with_context(|| {
@@ -482,6 +561,13 @@ fn resolve_repos(
 
         if !seen_roots.insert(repo_root.clone()) {
             continue;
+        }
+
+        if existing_roots.contains(&repo_root) {
+            bail!(
+                "repository {} is already part of the workspace",
+                repo_root.display()
+            );
         }
 
         if !git::has_remote_origin(&repo_root)? {
@@ -639,26 +725,52 @@ fn build_create_result(
         branch_name: record.branch_name.clone(),
         workspace_dir: record.workspace_dir.clone(),
         registry_path,
-        stashed_source_repos: stashed_repos
-            .iter()
-            .map(|stash| StashedSourceRepoView {
-                source_repo_path: stash.source_repo_path.clone(),
-                stash_commit: stash.stash_commit.clone(),
-                stash_message: stash.stash_message.clone(),
-            })
-            .collect(),
-        repos: record
-            .repos
-            .iter()
-            .map(|repo| WorkspaceRepoView {
-                repo_name: repo.repo_name.clone(),
-                source_repo_path: repo.source_repo_path.clone(),
-                worktree_path: repo.worktree_path.clone(),
-                base_commit: repo.base_commit.clone(),
-                exists_on_disk: repo.worktree_path.exists(),
-            })
-            .collect(),
+        stashed_source_repos: build_stashed_source_repo_views(stashed_repos),
+        repos: build_workspace_repo_views(&record.repos),
     }
+}
+
+fn build_add_result(
+    record: &WorkspaceRecord,
+    registry_path: PathBuf,
+    stashed_repos: &[AutoStashedRepo],
+    added_repos: &[RepoRecord],
+) -> AddWorkspaceReposResult {
+    AddWorkspaceReposResult {
+        workspace_name: record.name.clone(),
+        branch_name: record.branch_name.clone(),
+        workspace_dir: record.workspace_dir.clone(),
+        registry_path,
+        stashed_source_repos: build_stashed_source_repo_views(stashed_repos),
+        added_repos: build_workspace_repo_views(added_repos),
+        repos: build_workspace_repo_views(&record.repos),
+    }
+}
+
+fn build_stashed_source_repo_views(
+    stashed_repos: &[AutoStashedRepo],
+) -> Vec<StashedSourceRepoView> {
+    stashed_repos
+        .iter()
+        .map(|stash| StashedSourceRepoView {
+            source_repo_path: stash.source_repo_path.clone(),
+            stash_commit: stash.stash_commit.clone(),
+            stash_message: stash.stash_message.clone(),
+        })
+        .collect()
+}
+
+fn build_workspace_repo_views(repos: &[RepoRecord]) -> Vec<WorkspaceRepoView> {
+    repos
+        .iter()
+        .map(|repo| WorkspaceRepoView {
+            repo_name: repo.repo_name.clone(),
+            source_repo_path: repo.source_repo_path.clone(),
+            worktree_path: repo.worktree_path.clone(),
+            base_commit: repo.base_commit.clone(),
+            exists_on_disk: repo.worktree_path.exists(),
+        })
+        .collect()
 }
 
 fn determine_health(workspace: &WorkspaceRecord) -> WorkspaceHealth {
@@ -687,8 +799,8 @@ fn current_epoch_seconds() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_base_dir, CreateWorkspaceRequest, RemoveBranchAction, RemoveWorkspaceRequest,
-        WorkspaceHealth, WorkspaceManager,
+        default_base_dir, AddWorkspaceReposRequest, CreateWorkspaceRequest, RemoveBranchAction,
+        RemoveWorkspaceRequest, WorkspaceHealth, WorkspaceManager,
     };
     use crate::git;
     use anyhow::{Context, Result};
@@ -772,6 +884,102 @@ mod tests {
             .find(|repo| repo.repo_name == "beta")
             .expect("beta worktree");
         assert!(!beta_worktree.worktree_path.join("DIRTY.txt").exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_workspace_records_new_worktrees_and_registry_entries() -> Result<()> {
+        let sandbox = tempdir()?;
+        let repo_one = init_repo(sandbox.path(), "alpha")?;
+        let repo_two = init_repo(sandbox.path(), "beta")?;
+        let manager = WorkspaceManager::new(sandbox.path().join("spaces-home"));
+
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one.clone()],
+        })?;
+
+        let result = manager.add(AddWorkspaceReposRequest {
+            workspace_name: "steady-trail".into(),
+            repo_paths: vec![repo_two.clone()],
+        })?;
+
+        assert_eq!(result.workspace_name, "steady-trail");
+        assert_eq!(result.branch_name, "steady-trail");
+        assert_eq!(result.added_repos.len(), 1);
+        assert_eq!(result.added_repos[0].repo_name, "beta");
+        assert_eq!(result.repos.len(), 2);
+        assert_eq!(
+            git::current_branch(&result.added_repos[0].worktree_path)?,
+            "steady-trail"
+        );
+
+        let shown = manager.show("steady-trail")?;
+        assert_eq!(shown.repos.len(), 2);
+        assert_eq!(shown.health, WorkspaceHealth::Healthy);
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_auto_stashes_dirty_repo_and_records_metadata() -> Result<()> {
+        let sandbox = tempdir()?;
+        let repo_one = init_repo(sandbox.path(), "alpha")?;
+        let repo_two = init_repo(sandbox.path(), "beta")?;
+        let repo_two = fs::canonicalize(repo_two)?;
+        fs::write(repo_two.join("DIRTY.txt"), "dirty\n")?;
+
+        let manager = WorkspaceManager::new(sandbox.path().join("spaces-home"));
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one],
+        })?;
+
+        let result = manager.add(AddWorkspaceReposRequest {
+            workspace_name: "steady-trail".into(),
+            repo_paths: vec![repo_two.clone()],
+        })?;
+
+        assert_eq!(result.stashed_source_repos.len(), 1);
+        assert_eq!(result.stashed_source_repos[0].source_repo_path, repo_two);
+        assert!(result.stashed_source_repos[0]
+            .stash_message
+            .contains("steady-trail/beta"));
+        assert!(git::status_is_clean(&repo_two)?);
+        assert_eq!(git::list_stashes(&repo_two)?.len(), 1);
+        assert!(!result.added_repos[0]
+            .worktree_path
+            .join("DIRTY.txt")
+            .exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_rejects_repositories_already_in_the_workspace() -> Result<()> {
+        let sandbox = tempdir()?;
+        let repo_one = init_repo(sandbox.path(), "alpha")?;
+        let manager = WorkspaceManager::new(sandbox.path().join("spaces-home"));
+
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one.clone()],
+        })?;
+
+        let error = manager
+            .add(AddWorkspaceReposRequest {
+                workspace_name: "steady-trail".into(),
+                repo_paths: vec![repo_one],
+            })
+            .expect_err("adding the same repo twice should fail");
+
+        assert!(error
+            .to_string()
+            .contains("is already part of the workspace"));
 
         Ok(())
     }
