@@ -55,7 +55,15 @@ pub struct CreateWorkspaceResult {
     pub branch_name: String,
     pub workspace_dir: PathBuf,
     pub registry_path: PathBuf,
+    pub stashed_source_repos: Vec<StashedSourceRepoView>,
     pub repos: Vec<WorkspaceRepoView>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StashedSourceRepoView {
+    pub source_repo_path: PathBuf,
+    pub stash_commit: String,
+    pub stash_message: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -106,6 +114,13 @@ struct ResolvedRepo {
     base_commit: String,
 }
 
+#[derive(Debug, Clone)]
+struct AutoStashedRepo {
+    source_repo_path: PathBuf,
+    stash_commit: String,
+    stash_message: String,
+}
+
 impl WorkspaceManager {
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
@@ -127,7 +142,10 @@ impl WorkspaceManager {
         }
 
         fs::create_dir_all(self.base_dir()).with_context(|| {
-            format!("failed to create base directory {}", self.base_dir().display())
+            format!(
+                "failed to create base directory {}",
+                self.base_dir().display()
+            )
         })?;
 
         let mut registry = self.store.load()?;
@@ -155,32 +173,43 @@ impl WorkspaceManager {
             );
         }
 
-        let repos = resolve_repos(&request.repo_paths, &branch_name, &workspace_dir)?;
-        fs::create_dir_all(&workspace_dir).with_context(|| {
+        let mut repos = resolve_repos(&request.repo_paths, &branch_name, &workspace_dir)?;
+        let stashed_repos = auto_stash_repos(&repos, &workspace_name)?;
+
+        if let Err(error) = populate_base_commits(&mut repos) {
+            return Err(rollback_auto_stashes(error, &stashed_repos));
+        }
+
+        if let Err(error) = fs::create_dir_all(&workspace_dir).with_context(|| {
             format!(
                 "failed to create workspace directory {}",
                 workspace_dir.display()
             )
-        })?;
+        }) {
+            return Err(rollback_auto_stashes(error, &stashed_repos));
+        }
 
-        let created_record = match self.create_worktrees(&workspace_name, &branch_name, &workspace_dir, repos) {
-            Ok(record) => record,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&workspace_dir);
-                return Err(error);
-            }
-        };
+        let created_record =
+            match self.create_worktrees(&workspace_name, &branch_name, &workspace_dir, repos) {
+                Ok(record) => record,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&workspace_dir);
+                    return Err(rollback_auto_stashes(error, &stashed_repos));
+                }
+            };
 
         registry.upsert(created_record.clone());
         if let Err(error) = self.store.save(&registry) {
             rollback_workspace_creation(&created_record.repos, &created_record.branch_name);
             let _ = fs::remove_dir_all(&workspace_dir);
-            return Err(error).context("failed to persist registry after creating worktrees");
+            let error = error.context("failed to persist registry after creating worktrees");
+            return Err(rollback_auto_stashes(error, &stashed_repos));
         }
 
         Ok(build_create_result(
             &created_record,
             self.registry_path().to_path_buf(),
+            &stashed_repos,
         ))
     }
 
@@ -264,7 +293,8 @@ impl WorkspaceManager {
 
         if errors.is_empty() && request.branch_action == RemoveBranchAction::Delete {
             for repo in &workspace.repos {
-                if let Err(error) = git::delete_local_branch(&repo.source_repo_path, &workspace.branch_name)
+                if let Err(error) =
+                    git::delete_local_branch(&repo.source_repo_path, &workspace.branch_name)
                 {
                     errors.push(error.to_string());
                 }
@@ -385,9 +415,9 @@ fn resolve_workspace_name(
         .collect::<HashSet<_>>();
 
     if base_dir.exists() {
-        for entry in fs::read_dir(base_dir).with_context(|| {
-            format!("failed to inspect base directory {}", base_dir.display())
-        })? {
+        for entry in fs::read_dir(base_dir)
+            .with_context(|| format!("failed to inspect base directory {}", base_dir.display()))?
+        {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 existing.insert(entry.file_name().to_string_lossy().into_owned());
@@ -442,7 +472,10 @@ fn resolve_repos(
 
     for requested_path in requested_paths {
         let repo_root = git::resolve_repo_root(requested_path).with_context(|| {
-            format!("failed to treat {} as a local git repository", requested_path.display())
+            format!(
+                "failed to treat {} as a local git repository",
+                requested_path.display()
+            )
         })?;
         let repo_root = fs::canonicalize(&repo_root)
             .with_context(|| format!("failed to canonicalize {}", repo_root.display()))?;
@@ -451,12 +484,11 @@ fn resolve_repos(
             continue;
         }
 
-        if !git::status_is_clean(&repo_root)? {
-            bail!("repository {} has uncommitted or untracked changes", repo_root.display());
-        }
-
         if !git::has_remote_origin(&repo_root)? {
-            bail!("repository {} does not have an `origin` remote", repo_root.display());
+            bail!(
+                "repository {} does not have an `origin` remote",
+                repo_root.display()
+            );
         }
 
         if git::local_branch_exists(&repo_root, branch_name)? {
@@ -470,12 +502,15 @@ fn resolve_repos(
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_owned)
-            .ok_or_else(|| anyhow!("failed to determine a repo name for {}", repo_root.display()))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "failed to determine a repo name for {}",
+                    repo_root.display()
+                )
+            })?;
 
         if !seen_repo_names.insert(repo_name.clone()) {
-            bail!(
-                "multiple selected repositories resolve to the same basename `{repo_name}`"
-            );
+            bail!("multiple selected repositories resolve to the same basename `{repo_name}`");
         }
 
         let worktree_path = workspace_dir.join(&repo_name);
@@ -495,7 +530,41 @@ fn resolve_repos(
         });
     }
 
-    for repo in &mut repos {
+    Ok(repos)
+}
+
+fn auto_stash_repos(repos: &[ResolvedRepo], workspace_name: &str) -> Result<Vec<AutoStashedRepo>> {
+    let mut stashed_repos = Vec::new();
+
+    for repo in repos {
+        let stash_message = format!("spaces auto-stash {workspace_name}/{}", repo.repo_name);
+        let stash = match git::stash_if_dirty(&repo.repo_root, &stash_message) {
+            Ok(stash) => stash,
+            Err(error) => {
+                let error = anyhow!(
+                    "failed to auto-stash {}: {}",
+                    repo.repo_root.display(),
+                    error
+                );
+                return Err(rollback_auto_stashes(error, &stashed_repos));
+            }
+        };
+
+        match stash {
+            Some(stash) => stashed_repos.push(AutoStashedRepo {
+                source_repo_path: repo.repo_root.clone(),
+                stash_commit: stash.stash_commit,
+                stash_message: stash.stash_message,
+            }),
+            None => {}
+        }
+    }
+
+    Ok(stashed_repos)
+}
+
+fn populate_base_commits(repos: &mut [ResolvedRepo]) -> Result<()> {
+    for repo in repos {
         git::fetch_origin_main(&repo.repo_root)?;
         if !git::remote_main_exists(&repo.repo_root)? {
             bail!(
@@ -506,7 +575,43 @@ fn resolve_repos(
         repo.base_commit = git::remote_main_commit(&repo.repo_root)?;
     }
 
-    Ok(repos)
+    Ok(())
+}
+
+fn rollback_auto_stashes(error: anyhow::Error, stashed_repos: &[AutoStashedRepo]) -> anyhow::Error {
+    if stashed_repos.is_empty() {
+        return error;
+    }
+
+    match restore_auto_stashes(stashed_repos) {
+        Ok(()) => error,
+        Err(restore_error) => anyhow!("{error}\n{restore_error}"),
+    }
+}
+
+fn restore_auto_stashes(stashed_repos: &[AutoStashedRepo]) -> Result<()> {
+    let mut errors = Vec::new();
+
+    for stash in stashed_repos.iter().rev() {
+        if let Err(error) = git::restore_stash(&stash.source_repo_path, &stash.stash_commit) {
+            errors.push(format!(
+                "failed to restore auto-stash for {} ({}) [{}]: {}",
+                stash.source_repo_path.display(),
+                stash.stash_commit,
+                stash.stash_message,
+                error
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to restore auto-stashed source repos:\n{}",
+            errors.join("\n")
+        )
+    }
 }
 
 fn rollback_workspace_creation(repos: &[RepoRecord], branch_name: &str) {
@@ -527,12 +632,21 @@ fn rollback_created_worktrees(created: &[(PathBuf, PathBuf)], branch_name: &str)
 fn build_create_result(
     record: &WorkspaceRecord,
     registry_path: PathBuf,
+    stashed_repos: &[AutoStashedRepo],
 ) -> CreateWorkspaceResult {
     CreateWorkspaceResult {
         workspace_name: record.name.clone(),
         branch_name: record.branch_name.clone(),
         workspace_dir: record.workspace_dir.clone(),
         registry_path,
+        stashed_source_repos: stashed_repos
+            .iter()
+            .map(|stash| StashedSourceRepoView {
+                source_repo_path: stash.source_repo_path.clone(),
+                stash_commit: stash.stash_commit.clone(),
+                stash_message: stash.stash_message.clone(),
+            })
+            .collect(),
         repos: record
             .repos
             .iter()
@@ -630,24 +744,72 @@ mod tests {
     }
 
     #[test]
-    fn create_fails_for_dirty_repo_before_writing_registry() -> Result<()> {
+    fn create_auto_stashes_dirty_repo_and_records_metadata() -> Result<()> {
         let sandbox = tempdir()?;
         let repo_one = init_repo(sandbox.path(), "alpha")?;
         let repo_two = init_repo(sandbox.path(), "beta")?;
+        let repo_two = fs::canonicalize(repo_two)?;
         fs::write(repo_two.join("DIRTY.txt"), "dirty\n")?;
+
+        let manager = WorkspaceManager::new(sandbox.path().join("spaces-home"));
+        let result = manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("rapid-signal".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one, repo_two.clone()],
+        })?;
+
+        assert_eq!(result.stashed_source_repos.len(), 1);
+        assert_eq!(result.stashed_source_repos[0].source_repo_path, repo_two);
+        assert!(result.stashed_source_repos[0]
+            .stash_message
+            .contains("rapid-signal/beta"));
+        assert!(git::status_is_clean(&repo_two)?);
+        assert_eq!(git::list_stashes(&repo_two)?.len(), 1);
+
+        let beta_worktree = result
+            .repos
+            .iter()
+            .find(|repo| repo.repo_name == "beta")
+            .expect("beta worktree");
+        assert!(!beta_worktree.worktree_path.join("DIRTY.txt").exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_restores_staged_changes_when_fetch_fails_after_auto_stash() -> Result<()> {
+        let sandbox = tempdir()?;
+        let repo_one = init_repo(sandbox.path(), "alpha")?;
+        let repo_two = init_repo(sandbox.path(), "beta")?;
+        let repo_two = fs::canonicalize(repo_two)?;
+        fs::write(repo_two.join("STAGED.txt"), "staged\n")?;
+        run(Command::new("git")
+            .current_dir(&repo_two)
+            .arg("add")
+            .arg("STAGED.txt"))?;
+        run(Command::new("git")
+            .current_dir(&repo_two)
+            .arg("remote")
+            .arg("set-url")
+            .arg("origin")
+            .arg(sandbox.path().join("missing-origin.git")))?;
 
         let manager = WorkspaceManager::new(sandbox.path().join("spaces-home"));
         let error = manager
             .create(CreateWorkspaceRequest {
-                workspace_name: Some("rapid-signal".into()),
+                workspace_name: Some("broken-flight".into()),
                 branch_name: None,
-                repo_paths: vec![repo_one, repo_two],
+                repo_paths: vec![repo_one, repo_two.clone()],
             })
-            .expect_err("dirty repo should fail");
+            .expect_err("fetch should fail after auto-stash");
 
-        assert!(error.to_string().contains("uncommitted or untracked changes"));
+        assert!(error.to_string().contains("failed to fetch origin/main"));
         assert!(!manager.registry_path().exists());
-        assert!(!manager.base_dir().join("rapid-signal").exists());
+        assert!(!manager.base_dir().join("broken-flight").exists());
+        assert!(git::list_stashes(&repo_two)?.is_empty());
+        assert!(git::status_entries(&repo_two)?
+            .iter()
+            .any(|entry| entry == "A  STAGED.txt"));
 
         Ok(())
     }
@@ -706,67 +868,54 @@ mod tests {
         let remote_path = base_dir.join(format!("{name}-origin.git"));
         let repo_path = base_dir.join(name);
 
-        run(Command::new("git").arg("init").arg("--bare").arg(&remote_path))?;
+        run(Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&remote_path))?;
         run(Command::new("git").arg("init").arg(&repo_path))?;
-        run(
-            Command::new("git")
-                .current_dir(&repo_path)
-                .arg("config")
-                .arg("user.name")
-                .arg("Spaces Test"),
-        )?;
-        run(
-            Command::new("git")
-                .current_dir(&repo_path)
-                .arg("config")
-                .arg("user.email")
-                .arg("spaces@example.com"),
-        )?;
-        run(
-            Command::new("git")
-                .current_dir(&repo_path)
-                .arg("checkout")
-                .arg("-b")
-                .arg("main"),
-        )?;
+        run(Command::new("git")
+            .current_dir(&repo_path)
+            .arg("config")
+            .arg("user.name")
+            .arg("Spaces Test"))?;
+        run(Command::new("git")
+            .current_dir(&repo_path)
+            .arg("config")
+            .arg("user.email")
+            .arg("spaces@example.com"))?;
+        run(Command::new("git")
+            .current_dir(&repo_path)
+            .arg("checkout")
+            .arg("-b")
+            .arg("main"))?;
 
         fs::write(repo_path.join("README.md"), format!("# {name}\n"))?;
-        run(
-            Command::new("git")
-                .current_dir(&repo_path)
-                .arg("add")
-                .arg("README.md"),
-        )?;
-        run(
-            Command::new("git")
-                .current_dir(&repo_path)
-                .arg("commit")
-                .arg("-m")
-                .arg("initial"),
-        )?;
-        run(
-            Command::new("git")
-                .current_dir(&repo_path)
-                .arg("remote")
-                .arg("add")
-                .arg("origin")
-                .arg(&remote_path),
-        )?;
-        run(
-            Command::new("git")
-                .current_dir(&repo_path)
-                .arg("push")
-                .arg("-u")
-                .arg("origin")
-                .arg("main"),
-        )?;
-        run(
-            Command::new("git")
-                .current_dir(&repo_path)
-                .arg("fetch")
-                .arg("origin")
-                .arg("main"),
-        )?;
+        run(Command::new("git")
+            .current_dir(&repo_path)
+            .arg("add")
+            .arg("README.md"))?;
+        run(Command::new("git")
+            .current_dir(&repo_path)
+            .arg("commit")
+            .arg("-m")
+            .arg("initial"))?;
+        run(Command::new("git")
+            .current_dir(&repo_path)
+            .arg("remote")
+            .arg("add")
+            .arg("origin")
+            .arg(&remote_path))?;
+        run(Command::new("git")
+            .current_dir(&repo_path)
+            .arg("push")
+            .arg("-u")
+            .arg("origin")
+            .arg("main"))?;
+        run(Command::new("git")
+            .current_dir(&repo_path)
+            .arg("fetch")
+            .arg("origin")
+            .arg("main"))?;
 
         Ok(repo_path)
     }

@@ -3,9 +3,9 @@ use rand::Rng;
 use std::collections::HashSet;
 
 const ADJECTIVES: &[&str] = &[
-    "amber", "brisk", "calm", "clever", "dapper", "eager", "ember", "fable", "granite",
-    "harbor", "jolly", "kind", "lively", "maple", "merry", "nimble", "orchid", "pebble",
-    "plucky", "rapid", "river", "spruce", "steady", "sunny", "tidy", "vivid",
+    "amber", "brisk", "calm", "clever", "dapper", "eager", "ember", "fable", "granite", "harbor",
+    "jolly", "kind", "lively", "maple", "merry", "nimble", "orchid", "pebble", "plucky", "rapid",
+    "river", "spruce", "steady", "sunny", "tidy", "vivid",
 ];
 
 const NOUNS: &[&str] = &[

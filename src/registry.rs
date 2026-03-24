@@ -39,7 +39,9 @@ impl Default for Registry {
 
 impl Registry {
     pub fn get(&self, workspace_name: &str) -> Option<&WorkspaceRecord> {
-        self.workspaces.iter().find(|workspace| workspace.name == workspace_name)
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.name == workspace_name)
     }
 
     pub fn contains_workspace(&self, workspace_name: &str) -> bool {
@@ -49,7 +51,8 @@ impl Registry {
     pub fn upsert(&mut self, workspace: WorkspaceRecord) {
         self.remove(&workspace.name);
         self.workspaces.push(workspace);
-        self.workspaces.sort_by(|left, right| left.name.cmp(&right.name));
+        self.workspaces
+            .sort_by(|left, right| left.name.cmp(&right.name));
     }
 
     pub fn remove(&mut self, workspace_name: &str) -> Option<WorkspaceRecord> {
@@ -108,7 +111,10 @@ impl RegistryStore {
 
     pub fn save(&self, registry: &Registry) -> Result<()> {
         fs::create_dir_all(&self.base_dir).with_context(|| {
-            format!("failed to create base directory {}", self.base_dir.display())
+            format!(
+                "failed to create base directory {}",
+                self.base_dir.display()
+            )
         })?;
 
         let temp_path = self.registry_path.with_extension("json.tmp");

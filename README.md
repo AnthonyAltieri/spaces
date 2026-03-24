@@ -49,6 +49,12 @@ Run it directly with Cargo:
 cargo run -- create ~/code/dotfiles ~/code/firecrawl
 ```
 
+Use interactive discovery from a parent directory:
+
+```bash
+cargo run -- create ~/code
+```
+
 Or run the built binary:
 
 ```bash
@@ -88,12 +94,26 @@ JSON output for automation:
 spaces create --json ~/code/dotfiles ~/code/firecrawl
 ```
 
+If you pass a single directory that is not itself a Git repo, `create` recursively discovers repos under that directory and opens an interactive multi-select prompt. Type to filter, press `Space` to toggle repos, and `Enter` to continue with the selected set.
+
+```bash
+spaces create ~/code
+```
+
+Directory mode requires a terminal. For non-interactive use, pass explicit repo paths instead.
+
 ### List
 
 List tracked workspaces:
 
 ```bash
 spaces list
+```
+
+Short alias:
+
+```bash
+spaces ls
 ```
 
 List from a custom base directory:
@@ -146,24 +166,27 @@ Workspace metadata is stored in `~/.spaces/registry.json` by default. The regist
 
 This makes `list`, `show`, and `remove` straightforward without scanning arbitrary directories.
 
-### 3. Fail Fast Before Mutating
+### 3. Clean The Source Repo Before Mutating
 
-`create` validates all selected repos before making worktrees. It rejects repos that:
+`create` validates all selected repos before making worktrees. For dirty repos, it creates an auto-stash in the source repo and then builds the workspace from a freshly fetched `origin/main`.
+
+It still rejects repos that:
 
 - are not valid Git repos
-- are dirty
 - do not have `origin`
 - do not have `origin/main` after fetch
 - already contain the requested local branch
 - would collide on worktree directory name
 
-This avoids partially-created multi-repo workspaces caused by obvious preflight failures.
+This keeps the new workspace clean while still preserving source-repo changes for later manual recovery.
 
 ### 4. Roll Back On Mid-Create Failure
 
 If worktree creation succeeds for some repos and then fails for a later repo, the tool removes any worktrees and branches it already created before returning an error.
 
 If registry persistence fails after worktrees are created, it also rolls back those created worktrees and branches.
+
+If failure happens after an auto-stash was created, the tool also restores those source-repo changes before returning the error.
 
 ### 5. Shared Branch Name By Default
 
@@ -180,6 +203,9 @@ Every command supports `--json`. Human-readable debug-style output is useful for
 ## Operational Notes
 
 - `list`, `show`, and `remove` all support `--base-dir`, not just `create`
+- `ls` is an alias for `list`
+- `create --json` reports which source repos were auto-stashed
+- `create <dir>` recursively discovers repos under `<dir>` when `<dir>` is not itself a repo and then prompts for a filtered multi-select
 - duplicate repo paths are deduplicated by canonical repo root
 - repos with the same basename are rejected because each repo gets its own directory under the workspace
 - `show` and `list` surface stale state if worktrees or workspace directories are missing on disk
@@ -192,4 +218,4 @@ The current implementation has been verified in two ways:
 - `cargo test` passes
 - live verification succeeded against `~/code/dotfiles` plus a temporary throwaway repo under `~/code`
 
-The live verification also confirmed the safety path: attempting to include dirty `~/code/bond` fails before any workspace is created.
+The automated test coverage also confirms the dirty-repo path: dirty repos are auto-stashed, fresh worktrees are created from `origin/main`, and rollback restores source-repo state if create later fails.
