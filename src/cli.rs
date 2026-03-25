@@ -5,7 +5,7 @@ use crate::app::{
 use crate::git;
 use crate::repo_picker::{prompt_for_repo_selection as run_repo_picker, RepoPromptOption};
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -31,6 +31,7 @@ enum Commands {
     Add(AddArgs),
     #[command(alias = "ls")]
     List(ListArgs),
+    Cwd(CwdArgs),
     Show(ShowArgs),
     Remove(RemoveArgs),
 }
@@ -73,6 +74,22 @@ struct AddArgs {
 #[derive(Debug, Args)]
 struct ShowArgs {
     workspace: String,
+    #[arg(long)]
+    base_dir: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("workspace_selector")
+        .required(true)
+        .args(["workspace", "last"])
+))]
+struct CwdArgs {
+    workspace: Option<String>,
+    #[arg(long)]
+    last: bool,
     #[arg(long)]
     base_dir: Option<PathBuf>,
     #[arg(long)]
@@ -153,6 +170,24 @@ where
             let result = manager.list()?;
             let _ = args.json;
             render(output, true, &result)
+        }
+        Some(Commands::Cwd(args)) => {
+            let manager = WorkspaceManager::new(args.base_dir.unwrap_or(default_base_dir()?));
+            let cwd = if args.last {
+                manager.cwd_last()?
+            } else {
+                manager.cwd(
+                    args.workspace
+                        .as_deref()
+                        .expect("clap should require a selector"),
+                )?
+            };
+            if args.json {
+                render(output, true, &cwd)
+            } else {
+                writeln!(output, "{}", cwd.workspace_dir.display())
+                    .context("failed to write cwd output")
+            }
         }
         Some(Commands::Show(args)) => {
             let manager = WorkspaceManager::new(args.base_dir.unwrap_or(default_base_dir()?));
@@ -359,11 +394,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{run_from, run_from_with_selector};
+    use super::{run_from, run_from_with_selector, Cli};
     use crate::app::{CreateWorkspaceRequest, WorkspaceManager};
     use crate::registry::{Registry, RegistryStore, WorkspaceRecord};
     use anyhow::Context;
     use anyhow::Result;
+    use clap::error::ErrorKind;
+    use clap::Parser;
     use serde_json::Value;
     use std::fs;
     use std::io::Cursor;
@@ -482,6 +519,294 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn cwd_uses_custom_base_dir() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let workspace_dir = base_dir.join("steady-trail");
+        std::fs::create_dir_all(&workspace_dir)?;
+        let store = RegistryStore::new(base_dir.clone());
+        let mut registry = Registry::default();
+        registry.upsert(WorkspaceRecord {
+            name: "steady-trail".into(),
+            branch_name: "steady-trail".into(),
+            created_at_epoch_seconds: 123,
+            workspace_dir: workspace_dir.clone(),
+            repos: Vec::new(),
+        });
+        store.save(&registry)?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "cwd",
+                "steady-trail",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        assert_eq!(
+            String::from_utf8(output)?,
+            format!("{}\n", workspace_dir.display())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cwd_supports_json_output() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let workspace_dir = base_dir.join("steady-trail");
+        std::fs::create_dir_all(&workspace_dir)?;
+        let store = RegistryStore::new(base_dir.clone());
+        let mut registry = Registry::default();
+        registry.upsert(WorkspaceRecord {
+            name: "steady-trail".into(),
+            branch_name: "steady-trail".into(),
+            created_at_epoch_seconds: 123,
+            workspace_dir: workspace_dir.clone(),
+            repos: Vec::new(),
+        });
+        store.save(&registry)?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "cwd",
+                "steady-trail",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+                "--json",
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let value: Value = serde_json::from_slice(&output)?;
+        assert_eq!(value["workspace_name"], "steady-trail");
+        assert_eq!(
+            value["workspace_dir"],
+            Value::String(path_to_string(workspace_dir))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cwd_last_uses_most_recent_workspace() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let older_workspace_dir = base_dir.join("amber-anchor");
+        let newer_workspace_dir = base_dir.join("steady-trail");
+        fs::create_dir_all(&older_workspace_dir)?;
+        fs::create_dir_all(&newer_workspace_dir)?;
+        let store = RegistryStore::new(base_dir.clone());
+        let mut registry = Registry::default();
+        registry.upsert(WorkspaceRecord {
+            name: "amber-anchor".into(),
+            branch_name: "amber-anchor".into(),
+            created_at_epoch_seconds: 100,
+            workspace_dir: older_workspace_dir,
+            repos: Vec::new(),
+        });
+        registry.upsert(WorkspaceRecord {
+            name: "steady-trail".into(),
+            branch_name: "steady-trail".into(),
+            created_at_epoch_seconds: 200,
+            workspace_dir: newer_workspace_dir.clone(),
+            repos: Vec::new(),
+        });
+        store.save(&registry)?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "cwd",
+                "--last",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        assert_eq!(
+            String::from_utf8(output)?,
+            format!("{}\n", newer_workspace_dir.display())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cwd_last_supports_json_output() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let older_workspace_dir = base_dir.join("amber-anchor");
+        let newer_workspace_dir = base_dir.join("steady-trail");
+        fs::create_dir_all(&older_workspace_dir)?;
+        fs::create_dir_all(&newer_workspace_dir)?;
+        let store = RegistryStore::new(base_dir.clone());
+        let mut registry = Registry::default();
+        registry.upsert(WorkspaceRecord {
+            name: "amber-anchor".into(),
+            branch_name: "amber-anchor".into(),
+            created_at_epoch_seconds: 100,
+            workspace_dir: older_workspace_dir,
+            repos: Vec::new(),
+        });
+        registry.upsert(WorkspaceRecord {
+            name: "steady-trail".into(),
+            branch_name: "steady-trail".into(),
+            created_at_epoch_seconds: 200,
+            workspace_dir: newer_workspace_dir.clone(),
+            repos: Vec::new(),
+        });
+        store.save(&registry)?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "cwd",
+                "--last",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+                "--json",
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let value: Value = serde_json::from_slice(&output)?;
+        assert_eq!(value["workspace_name"], "steady-trail");
+        assert_eq!(
+            value["workspace_dir"],
+            Value::String(path_to_string(newer_workspace_dir))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cwd_errors_when_workspace_dir_is_missing() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let workspace_dir = base_dir.join("steady-trail");
+        let store = RegistryStore::new(base_dir.clone());
+        let mut registry = Registry::default();
+        registry.upsert(WorkspaceRecord {
+            name: "steady-trail".into(),
+            branch_name: "steady-trail".into(),
+            created_at_epoch_seconds: 123,
+            workspace_dir: workspace_dir.clone(),
+            repos: Vec::new(),
+        });
+        store.save(&registry)?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let error = run_from(
+            [
+                "spaces",
+                "cwd",
+                "steady-trail",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )
+        .expect_err("missing workspace dir should fail");
+
+        assert!(error
+            .to_string()
+            .contains("workspace directory is missing at"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cwd_errors_for_unknown_workspace() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let error = run_from(
+            [
+                "spaces",
+                "cwd",
+                "steady-trail",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )
+        .expect_err("unknown workspace should fail");
+
+        assert!(error
+            .to_string()
+            .contains("workspace `steady-trail` was not found"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cwd_last_errors_when_no_workspaces_are_tracked() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let error = run_from(
+            [
+                "spaces",
+                "cwd",
+                "--last",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )
+        .expect_err("empty registry should fail");
+
+        assert!(error.to_string().contains("no workspaces are tracked"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cwd_parser_rejects_combining_workspace_and_last() {
+        let error = Cli::try_parse_from(["spaces", "cwd", "steady-trail", "--last"])
+            .expect_err("workspace name and --last should conflict");
+
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cwd_parser_requires_workspace_or_last() {
+        let error =
+            Cli::try_parse_from(["spaces", "cwd"]).expect_err("cwd should require a selector");
+
+        assert!(error
+            .to_string()
+            .contains("required arguments were not provided"));
     }
 
     #[test]
