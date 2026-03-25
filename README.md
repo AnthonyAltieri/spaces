@@ -137,7 +137,13 @@ Use a custom base directory when the workspace registry lives somewhere else:
 spaces cwd spring-rollout --base-dir /tmp/spaces-home
 ```
 
-`cwd` prints only the directory path, which makes it suitable for shell wrappers. See [Shell Integration](#shell-integration) below for a `zsh` wrapper that turns `spaces cwd <name>` into an actual shell `cd`. It fails if the workspace is not in the registry or if the recorded workspace directory is missing on disk.
+Look up the most recently created tracked workspace instead of naming one explicitly:
+
+```bash
+spaces cwd --last
+```
+
+`cwd` prints only the directory path, which makes it suitable for shell wrappers. See [Shell Integration](#shell-integration) below for a `zsh` wrapper that turns `spaces cwd <name>` or `spaces cwd --last` into an actual shell `cd`. It fails if the requested workspace is not in the registry, if no workspaces are tracked for `--last`, or if the recorded workspace directory is missing on disk.
 
 If you need machine-readable output instead, `cwd` also supports `--json`:
 

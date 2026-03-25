@@ -118,6 +118,12 @@ pub struct RemoveWorkspaceResult {
     pub removed_worktree_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CwdWorkspaceResult {
+    pub workspace_name: String,
+    pub workspace_dir: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceManager {
     store: RegistryStore,
@@ -313,21 +319,23 @@ impl WorkspaceManager {
         })
     }
 
-    pub fn cwd(&self, workspace_name: &str) -> Result<PathBuf> {
+    pub fn cwd(&self, workspace_name: &str) -> Result<CwdWorkspaceResult> {
         let registry = self.store.load()?;
         let workspace = registry
             .get(workspace_name)
             .cloned()
             .ok_or_else(|| anyhow!("workspace `{workspace_name}` was not found"))?;
 
-        if !workspace.workspace_dir.exists() {
-            bail!(
-                "workspace directory is missing at {}",
-                workspace.workspace_dir.display()
-            );
-        }
+        build_cwd_result(&workspace)
+    }
 
-        Ok(workspace.workspace_dir)
+    pub fn cwd_last(&self) -> Result<CwdWorkspaceResult> {
+        let registry = self.store.load()?;
+        let workspace = select_last_created_workspace(&registry.workspaces)
+            .cloned()
+            .ok_or_else(|| anyhow!("no workspaces are tracked"))?;
+
+        build_cwd_result(&workspace)
     }
 
     pub fn show(&self, workspace_name: &str) -> Result<ShowWorkspaceResult> {
@@ -788,6 +796,28 @@ fn build_workspace_repo_views(repos: &[RepoRecord]) -> Vec<WorkspaceRepoView> {
             exists_on_disk: repo.worktree_path.exists(),
         })
         .collect()
+}
+
+fn build_cwd_result(workspace: &WorkspaceRecord) -> Result<CwdWorkspaceResult> {
+    if !workspace.workspace_dir.exists() {
+        bail!(
+            "workspace directory is missing at {}",
+            workspace.workspace_dir.display()
+        );
+    }
+
+    Ok(CwdWorkspaceResult {
+        workspace_name: workspace.name.clone(),
+        workspace_dir: workspace.workspace_dir.clone(),
+    })
+}
+
+fn select_last_created_workspace(workspaces: &[WorkspaceRecord]) -> Option<&WorkspaceRecord> {
+    workspaces.iter().max_by(|left, right| {
+        left.created_at_epoch_seconds
+            .cmp(&right.created_at_epoch_seconds)
+            .then_with(|| left.name.cmp(&right.name))
+    })
 }
 
 fn determine_health(workspace: &WorkspaceRecord) -> WorkspaceHealth {
