@@ -88,16 +88,21 @@ cargo test
 
 ## Release Process
 
-Homebrew releases are driven by semver Git tags. When a tag such as `v0.1.0` is pushed:
+Homebrew publishing is driven by version changes in `Cargo.toml` on `main`. When a push to `main` changes the package version:
 
-1. the GitHub Actions workflow runs `cargo test`
-2. the workflow downloads the tagged source archive and computes its SHA256
-3. the workflow renders `Formula/spaces.rb` in `AnthonyAltieri/homebrew-tap`
-4. the workflow runs `brew audit`, `brew install --build-from-source`, and `brew test`
-5. the workflow commits the updated formula to the tap repo
+1. the GitHub Actions workflow compares the previous `Cargo.toml` version to the current one
+2. if the version did not change, the workflow exits cleanly without publishing
+3. if the new version already has a `vX.Y.Z` tag on another commit, the workflow fails with a clear version-conflict error
+4. if the tag does not exist yet, the workflow creates and pushes `vX.Y.Z`
+5. the workflow runs `cargo test`
+6. the workflow downloads the tagged source archive and computes its SHA256
+7. the workflow renders `Formula/spaces.rb` in `AnthonyAltieri/homebrew-tap`
+8. the workflow runs `brew audit`, `brew install --build-from-source`, and `brew test`
+9. the workflow commits the updated formula to the tap repo
 
 Before the workflow can publish formula updates, configure the `HOMEBREW_TAP_GITHUB_TOKEN` repository secret with a token that can push to `AnthonyAltieri/homebrew-tap`.
 
+If a publish attempt fails after the version bump lands, you can rerun the workflow manually with `workflow_dispatch` on the same commit instead of bumping the version again.
 ## Commands
 
 ### Create
