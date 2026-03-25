@@ -14,6 +14,7 @@ It is built for the case where one agent or one shell session needs to work acro
 - uses the workspace name as the default branch name across repos
 - stores workspace metadata in `registry.json`
 - supports machine-readable `--json` output on every command
+- supports a shell-friendly `cwd` lookup command for optional `cd` wrappers
 
 Example workspace layout:
 
@@ -122,6 +123,28 @@ List from a custom base directory:
 spaces list --base-dir /tmp/spaces-home --json
 ```
 
+### Cwd
+
+Print the on-disk workspace directory for a tracked workspace:
+
+```bash
+spaces cwd spring-rollout
+```
+
+Use a custom base directory when the workspace registry lives somewhere else:
+
+```bash
+spaces cwd spring-rollout --base-dir /tmp/spaces-home
+```
+
+`cwd` prints only the directory path, which makes it suitable for shell wrappers. It fails if the workspace is not in the registry or if the recorded workspace directory is missing on disk.
+
+If you need machine-readable output instead, `cwd` also supports `--json`:
+
+```bash
+spaces cwd spring-rollout --json
+```
+
 ### Add
 
 Add new repos into an existing workspace using that workspace's branch name:
@@ -220,15 +243,43 @@ Every command supports `--json`. Human-readable debug-style output is useful for
 ## Operational Notes
 
 - `add` creates new child worktrees inside an existing workspace directory and updates the recorded repo list
+- `cwd` prints the workspace directory as a plain path for shell integration
 - `list`, `show`, and `remove` all support `--base-dir`, not just `create`
 - `ls` is an alias for `list`
-- JSON output is the default for all commands
+- JSON output is the default for all commands except `cwd`, which defaults to a plain path for shell integration
 - `spaces -i <dir>` inspects only the immediate child directories under `<dir>` when `<dir>` is not itself a repo and then opens a filtered checkbox picker in the terminal
 - `add` uses the existing workspace branch name and validates new repos against the current child directory names in that workspace
 - duplicate repo paths are deduplicated by canonical repo root
 - repos with the same basename are rejected because each repo gets its own directory under the workspace
 - `show` and `list` surface stale state if worktrees or workspace directories are missing on disk
 - `remove` fails if it cannot fully remove the recorded worktrees
+
+## Shell Integration
+
+The `spaces` binary cannot change the current directory of the parent shell by itself. If you want `spaces cwd <name>` to actually move your shell, add a wrapper in `zsh`:
+
+```bash
+spaces() {
+  if [[ "$1" == "cwd" ]]; then
+    shift
+
+    local dir
+    dir=$(command spaces cwd "$@") || return
+    builtin cd -- "$dir"
+    return
+  fi
+
+  command spaces "$@"
+}
+```
+
+With that wrapper in place:
+
+```bash
+spaces cwd spring-rollout
+```
+
+changes the shell into the workspace directory, while every other `spaces` subcommand still delegates directly to the compiled binary.
 
 ## Verified Behavior
 

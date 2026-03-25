@@ -313,6 +313,23 @@ impl WorkspaceManager {
         })
     }
 
+    pub fn cwd(&self, workspace_name: &str) -> Result<PathBuf> {
+        let registry = self.store.load()?;
+        let workspace = registry
+            .get(workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("workspace `{workspace_name}` was not found"))?;
+
+        if !workspace.workspace_dir.exists() {
+            bail!(
+                "workspace directory is missing at {}",
+                workspace.workspace_dir.display()
+            );
+        }
+
+        Ok(workspace.workspace_dir)
+    }
+
     pub fn show(&self, workspace_name: &str) -> Result<ShowWorkspaceResult> {
         let registry = self.store.load()?;
         let workspace = registry
