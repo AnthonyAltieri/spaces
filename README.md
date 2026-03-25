@@ -35,6 +35,24 @@ Example workspace layout:
   - an `origin` remote
   - `origin/main`
 
+## Install With Homebrew
+
+`spaces` is published through the `AnthonyAltieri/tap` Homebrew tap.
+
+Prerequisites:
+
+- Homebrew installed
+- Git available on `PATH`
+
+Install:
+
+```bash
+brew tap AnthonyAltieri/tap
+brew install spaces
+```
+
+`spaces` shells out to `git` at runtime, so Git still needs to be installed even when the CLI itself comes from Homebrew.
+
 ## Build And Run
 
 Build the CLI:
@@ -66,6 +84,18 @@ Run tests:
 ```bash
 cargo test
 ```
+
+## Release Process
+
+Homebrew releases are driven by semver Git tags. When a tag such as `v0.1.0` is pushed:
+
+1. the GitHub Actions workflow runs `cargo test`
+2. the workflow downloads the tagged source archive and computes its SHA256
+3. the workflow renders `Formula/spaces.rb` in `AnthonyAltieri/homebrew-tap`
+4. the workflow runs `brew audit`, `brew install --build-from-source`, and `brew test`
+5. the workflow commits the updated formula to the tap repo
+
+Before the workflow can publish formula updates, configure the `HOMEBREW_TAP_GITHUB_TOKEN` repository secret with a token that can push to `AnthonyAltieri/homebrew-tap`.
 
 ## Commands
 

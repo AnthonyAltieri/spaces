@@ -2,6 +2,10 @@
 name = "spaces"
 version = "0.1.0"
 edition = "2021"
+description = "Create and manage coordinated multi-repo git workspaces"
+license = "MIT"
+repository = "https://github.com/AnthonyAltieri/spaces"
+homepage = "https://github.com/AnthonyAltieri/spaces"
 
 [dependencies]
 anyhow = "1.0"
