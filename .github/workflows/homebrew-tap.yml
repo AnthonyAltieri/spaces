@@ -1,0 +1,197 @@
+name: Publish Homebrew Tap
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine publish version
+        id: release
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          read_version() {
+            sed -n 's/^version = "\(.*\)"/\1/p' "$1" | head -n 1
+          }
+
+          current_version="$(read_version Cargo.toml)"
+          if [ -z "${current_version}" ]; then
+            echo "Failed to read package version from Cargo.toml." >&2
+            exit 1
+          fi
+
+          previous_version=""
+          before_sha="${GITHUB_EVENT_BEFORE:-}"
+          if [ -n "${before_sha}" ] && [ "${before_sha}" != "0000000000000000000000000000000000000000" ]; then
+            before_cargo="$(mktemp)"
+            if git show "${before_sha}:Cargo.toml" > "${before_cargo}" 2>/dev/null; then
+              previous_version="$(read_version "${before_cargo}")"
+            else
+              echo "Unable to read Cargo.toml from ${before_sha}; treating this push as a release candidate." >&2
+            fi
+            rm -f "${before_cargo}"
+          fi
+
+          echo "version=${current_version}" >> "${GITHUB_OUTPUT}"
+          echo "previous_version=${previous_version}" >> "${GITHUB_OUTPUT}"
+          echo "tag_name=v${current_version}" >> "${GITHUB_OUTPUT}"
+
+          if [ "${current_version}" = "${previous_version}" ]; then
+            echo "Cargo.toml version is still ${current_version}; skipping Homebrew publish."
+            echo "should_publish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          git fetch --tags origin
+
+          remote_tag_commit="$(git ls-remote origin "refs/tags/v${current_version}^{}" | awk 'NR==1 {print $1}')"
+          if [ -z "${remote_tag_commit}" ]; then
+            remote_tag_commit="$(git ls-remote origin "refs/tags/v${current_version}" | awk 'NR==1 {print $1}')"
+          fi
+
+          if [ -n "${remote_tag_commit}" ] && [ "${remote_tag_commit}" != "${GITHUB_SHA}" ]; then
+            echo "Cargo.toml version changed from ${previous_version:-<none>} to ${current_version}, but tag v${current_version} already exists at ${remote_tag_commit}. Bump Cargo.toml to a new version before publishing." >&2
+            exit 1
+          fi
+
+          if [ -n "${remote_tag_commit}" ]; then
+            echo "Tag v${current_version} already points at ${GITHUB_SHA}; continuing publish for this rerun."
+            echo "tag_exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "tag_exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+          echo "should_publish=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Run Rust tests
+        if: steps.release.outputs.should_publish == 'true'
+        run: cargo test
+
+      - name: Require tap token
+        if: steps.release.outputs.should_publish == 'true'
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN}" ]; then
+            echo "Set the HOMEBREW_TAP_GITHUB_TOKEN repository secret before publishing Homebrew releases." >&2
+            exit 1
+          fi
+
+      - name: Create release tag
+        if: steps.release.outputs.should_publish == 'true' && steps.release.outputs.tag_exists == 'false'
+        run: |
+          set -euo pipefail
+          git tag "${{ steps.release.outputs.tag_name }}" "${GITHUB_SHA}" || {
+            echo "Failed to create tag ${{ steps.release.outputs.tag_name }} for ${GITHUB_SHA}." >&2
+            exit 1
+          }
+          git push origin "refs/tags/${{ steps.release.outputs.tag_name }}" || {
+            echo "Failed to push tag ${{ steps.release.outputs.tag_name }} to origin. Check repository permissions." >&2
+            exit 1
+          }
+
+      - name: Compute source archive checksum
+        if: steps.release.outputs.should_publish == 'true'
+        id: archive
+        run: |
+          set -euo pipefail
+          archive_url="https://github.com/AnthonyAltieri/spaces/archive/refs/tags/${{ steps.release.outputs.tag_name }}.tar.gz"
+          archive_path="${RUNNER_TEMP}/spaces-${{ steps.release.outputs.tag_name }}.tar.gz"
+
+          curl -fsSL "${archive_url}" -o "${archive_path}" || {
+            echo "Failed to download the source archive for ${{ steps.release.outputs.tag_name }} from ${archive_url}." >&2
+            exit 1
+          }
+
+          archive_sha256="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+          if [ -z "${archive_sha256}" ]; then
+            echo "Failed to compute a SHA256 for ${archive_path}." >&2
+            exit 1
+          fi
+
+          {
+            echo "url=${archive_url}"
+            echo "sha256=${archive_sha256}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Clone tap repository
+        if: steps.release.outputs.should_publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh repo clone AnthonyAltieri/homebrew-tap "${RUNNER_TEMP}/homebrew-tap" || {
+            echo "Failed to clone AnthonyAltieri/homebrew-tap. Verify that HOMEBREW_TAP_GITHUB_TOKEN can access and push to the tap repository." >&2
+            exit 1
+          }
+
+      - name: Render formula
+        if: steps.release.outputs.should_publish == 'true'
+        run: |
+          set -euo pipefail
+          ./scripts/render-homebrew-formula.sh \
+            "${RUNNER_TEMP}/homebrew-tap/Formula/spaces.rb" \
+            "${{ steps.release.outputs.version }}" \
+            "${{ steps.archive.outputs.url }}" \
+            "${{ steps.archive.outputs.sha256 }}"
+
+      - name: Tap local checkout
+        if: steps.release.outputs.should_publish == 'true'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew untap AnthonyAltieri/tap || true
+          brew tap AnthonyAltieri/tap "${RUNNER_TEMP}/homebrew-tap"
+
+      - name: Validate formula
+        if: steps.release.outputs.should_publish == 'true'
+        env:
+          HOMEBREW_CACHE: ${{ runner.temp }}/homebrew-cache
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOMEBREW_CACHE}"
+          brew audit --strict AnthonyAltieri/tap/spaces
+          brew install --build-from-source AnthonyAltieri/tap/spaces
+          brew test spaces
+
+      - name: Publish formula update
+        if: steps.release.outputs.should_publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/homebrew-tap"
+
+          if git diff --quiet; then
+            echo "Tap already up to date for ${{ steps.release.outputs.tag_name }}."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/spaces.rb
+          git commit -m "spaces ${{ steps.release.outputs.tag_name }}"
+          git push origin HEAD || {
+            echo "Failed to push Formula/spaces.rb to AnthonyAltieri/homebrew-tap." >&2
+            exit 1
+          }
