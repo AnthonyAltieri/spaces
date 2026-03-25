@@ -1,0 +1,107 @@
+name: Publish Homebrew Tap
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches package version
+        run: |
+          set -euo pipefail
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          if [ -z "${cargo_version}" ]; then
+            echo "Failed to read package version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          if [ "${cargo_version}" != "${tag_version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+
+      - name: Run Rust tests
+        run: cargo test
+
+      - name: Require tap token
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN}" ]; then
+            echo "Set the HOMEBREW_TAP_GITHUB_TOKEN repository secret before publishing Homebrew releases." >&2
+            exit 1
+          fi
+
+      - name: Compute source archive checksum
+        id: archive
+        run: |
+          set -euo pipefail
+          archive_url="https://github.com/AnthonyAltieri/spaces/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          archive_path="${RUNNER_TEMP}/spaces-${GITHUB_REF_NAME}.tar.gz"
+
+          curl -fsSL "${archive_url}" -o "${archive_path}"
+
+          {
+            echo "url=${archive_url}"
+            echo "sha256=$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Clone tap repository
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: gh repo clone AnthonyAltieri/homebrew-tap "${RUNNER_TEMP}/homebrew-tap"
+
+      - name: Render formula
+        run: |
+          ./scripts/render-homebrew-formula.sh \
+            "${RUNNER_TEMP}/homebrew-tap/Formula/spaces.rb" \
+            "${GITHUB_REF_NAME#v}" \
+            "${{ steps.archive.outputs.url }}" \
+            "${{ steps.archive.outputs.sha256 }}"
+
+      - name: Tap local checkout
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew untap AnthonyAltieri/tap || true
+          brew tap AnthonyAltieri/tap "${RUNNER_TEMP}/homebrew-tap"
+
+      - name: Validate formula
+        env:
+          HOMEBREW_CACHE: ${{ runner.temp }}/homebrew-cache
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOMEBREW_CACHE}"
+          brew audit --strict AnthonyAltieri/tap/spaces
+          brew install --build-from-source AnthonyAltieri/tap/spaces
+          brew test spaces
+
+      - name: Publish formula update
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/homebrew-tap"
+
+          if git diff --quiet; then
+            echo "Tap already up to date for ${GITHUB_REF_NAME}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/spaces.rb
+          git commit -m "spaces ${GITHUB_REF_NAME}"
+          git push origin HEAD
