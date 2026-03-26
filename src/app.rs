@@ -119,6 +119,41 @@ pub struct RemoveWorkspaceResult {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClearWorkspacePreview {
+    pub workspace_name: String,
+    pub branch_name: String,
+    pub workspace_dir: PathBuf,
+    pub repos: Vec<WorkspaceRepoView>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClearWorkspacesPreview {
+    pub registry_path: PathBuf,
+    pub workspaces: Vec<ClearWorkspacePreview>,
+    pub workspace_count: usize,
+    pub worktree_count: usize,
+    pub branch_deletion_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FailedClearWorkspaceResult {
+    pub workspace_name: String,
+    pub branch_name: String,
+    pub workspace_dir: PathBuf,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClearWorkspacesResult {
+    pub registry_path: PathBuf,
+    pub attempted_workspace_count: usize,
+    pub removed_worktree_count: usize,
+    pub branch_action: RemoveBranchAction,
+    pub cleared_workspaces: Vec<RemoveWorkspaceResult>,
+    pub failed_workspaces: Vec<FailedClearWorkspaceResult>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CwdWorkspaceResult {
     pub workspace_name: String,
     pub workspace_dir: PathBuf,
@@ -363,6 +398,52 @@ impl WorkspaceManager {
                     exists_on_disk: repo.worktree_path.exists(),
                 })
                 .collect(),
+        })
+    }
+
+    pub fn clear_preview(&self) -> Result<ClearWorkspacesPreview> {
+        let registry = self.store.load()?;
+        if registry.workspaces.is_empty() {
+            bail!("no workspaces are tracked");
+        }
+
+        Ok(build_clear_preview(
+            &registry.workspaces,
+            self.registry_path().to_path_buf(),
+        ))
+    }
+
+    pub fn clear(&self) -> Result<ClearWorkspacesResult> {
+        let preview = self.clear_preview()?;
+        let mut cleared_workspaces = Vec::new();
+        let mut failed_workspaces = Vec::new();
+        let mut removed_worktree_count = 0_usize;
+
+        for workspace in &preview.workspaces {
+            match self.remove(RemoveWorkspaceRequest {
+                workspace_name: workspace.workspace_name.clone(),
+                branch_action: RemoveBranchAction::Delete,
+            }) {
+                Ok(result) => {
+                    removed_worktree_count += result.removed_worktree_count;
+                    cleared_workspaces.push(result);
+                }
+                Err(error) => failed_workspaces.push(FailedClearWorkspaceResult {
+                    workspace_name: workspace.workspace_name.clone(),
+                    branch_name: workspace.branch_name.clone(),
+                    workspace_dir: workspace.workspace_dir.clone(),
+                    error: error.to_string(),
+                }),
+            }
+        }
+
+        Ok(ClearWorkspacesResult {
+            registry_path: preview.registry_path,
+            attempted_workspace_count: preview.workspace_count,
+            removed_worktree_count,
+            branch_action: RemoveBranchAction::Delete,
+            cleared_workspaces,
+            failed_workspaces,
         })
     }
 
@@ -772,6 +853,33 @@ fn build_add_result(
     }
 }
 
+fn build_clear_preview(
+    records: &[WorkspaceRecord],
+    registry_path: PathBuf,
+) -> ClearWorkspacesPreview {
+    let workspaces = records
+        .iter()
+        .map(|record| ClearWorkspacePreview {
+            workspace_name: record.name.clone(),
+            branch_name: record.branch_name.clone(),
+            workspace_dir: record.workspace_dir.clone(),
+            repos: build_workspace_repo_views(&record.repos),
+        })
+        .collect::<Vec<_>>();
+    let worktree_count = workspaces
+        .iter()
+        .map(|workspace| workspace.repos.len())
+        .sum();
+
+    ClearWorkspacesPreview {
+        registry_path,
+        workspace_count: workspaces.len(),
+        worktree_count,
+        branch_deletion_count: worktree_count,
+        workspaces,
+    }
+}
+
 fn build_stashed_source_repo_views(
     stashed_repos: &[AutoStashedRepo],
 ) -> Vec<StashedSourceRepoView> {
@@ -1116,6 +1224,111 @@ mod tests {
 
         assert!(!git::local_branch_exists(&repo_one, "tidy-voyage")?);
         assert!(!git::local_branch_exists(&repo_two, "tidy-voyage")?);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_preview_describes_all_tracked_workspaces() -> Result<()> {
+        let sandbox = tempdir()?;
+        let repo_one = init_repo(sandbox.path(), "alpha")?;
+        let repo_two = init_repo(sandbox.path(), "beta")?;
+        let manager = WorkspaceManager::new(sandbox.path().join("spaces-home"));
+
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("amber-anchor".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one],
+        })?;
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_two],
+        })?;
+
+        let preview = manager.clear_preview()?;
+
+        assert_eq!(preview.workspace_count, 2);
+        assert_eq!(preview.worktree_count, 2);
+        assert_eq!(preview.branch_deletion_count, 2);
+        assert_eq!(preview.workspaces[0].workspace_name, "amber-anchor");
+        assert_eq!(preview.workspaces[0].branch_name, "amber-anchor");
+        assert_eq!(preview.workspaces[0].repos[0].repo_name, "alpha");
+        assert_eq!(preview.workspaces[1].workspace_name, "steady-trail");
+        assert_eq!(preview.workspaces[1].repos[0].repo_name, "beta");
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_removes_all_workspaces_and_deletes_branches() -> Result<()> {
+        let sandbox = tempdir()?;
+        let repo_one = init_repo(sandbox.path(), "alpha")?;
+        let repo_two = init_repo(sandbox.path(), "beta")?;
+        let manager = WorkspaceManager::new(sandbox.path().join("spaces-home"));
+
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("amber-anchor".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one.clone(), repo_two.clone()],
+        })?;
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one.clone(), repo_two.clone()],
+        })?;
+
+        let result = manager.clear()?;
+
+        assert_eq!(result.attempted_workspace_count, 2);
+        assert_eq!(result.removed_worktree_count, 4);
+        assert_eq!(result.branch_action, RemoveBranchAction::Delete);
+        assert_eq!(result.cleared_workspaces.len(), 2);
+        assert!(result.failed_workspaces.is_empty());
+        assert!(manager.list()?.workspaces.is_empty());
+        assert!(!git::local_branch_exists(&repo_one, "amber-anchor")?);
+        assert!(!git::local_branch_exists(&repo_one, "steady-trail")?);
+        assert!(!git::local_branch_exists(&repo_two, "amber-anchor")?);
+        assert!(!git::local_branch_exists(&repo_two, "steady-trail")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_is_best_effort_when_a_workspace_fails() -> Result<()> {
+        let sandbox = tempdir()?;
+        let repo_one = init_repo(sandbox.path(), "alpha")?;
+        let repo_two = init_repo(sandbox.path(), "beta")?;
+        let manager = WorkspaceManager::new(sandbox.path().join("spaces-home"));
+
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("amber-anchor".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one.clone()],
+        })?;
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_two.clone()],
+        })?;
+
+        fs::remove_dir_all(manager.base_dir().join("amber-anchor").join("alpha"))?;
+
+        let result = manager.clear()?;
+
+        assert_eq!(result.attempted_workspace_count, 2);
+        assert_eq!(result.cleared_workspaces.len(), 1);
+        assert_eq!(result.failed_workspaces.len(), 1);
+        assert_eq!(result.failed_workspaces[0].workspace_name, "amber-anchor");
+        assert!(result.failed_workspaces[0]
+            .error
+            .contains("worktree path is missing"));
+
+        let remaining = manager.list()?;
+        assert_eq!(remaining.workspaces.len(), 1);
+        assert_eq!(remaining.workspaces[0].workspace_name, "amber-anchor");
+        assert!(git::local_branch_exists(&repo_one, "amber-anchor")?);
+        assert!(!git::local_branch_exists(&repo_two, "steady-trail")?);
+
         Ok(())
     }
 
