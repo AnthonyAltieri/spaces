@@ -1,6 +1,6 @@
 use crate::app::{
-    default_base_dir, prompt_for_branch_action, AddWorkspaceReposRequest, CreateWorkspaceRequest,
-    RemoveBranchAction, RemoveWorkspaceRequest, WorkspaceManager,
+    default_base_dir, prompt_for_branch_action, AddWorkspaceReposRequest, ClearWorkspacesPreview,
+    CreateWorkspaceRequest, RemoveBranchAction, RemoveWorkspaceRequest, WorkspaceManager,
 };
 use crate::git;
 use crate::repo_picker::{prompt_for_repo_selection as run_repo_picker, RepoPromptOption};
@@ -31,6 +31,7 @@ enum Commands {
     Add(AddArgs),
     #[command(alias = "ls")]
     List(ListArgs),
+    Clear(ClearArgs),
     Cwd(CwdArgs),
     Show(ShowArgs),
     #[command(alias = "rm")]
@@ -59,6 +60,12 @@ struct ListArgs {
     base_dir: Option<PathBuf>,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ClearArgs {
+    #[arg(long)]
+    base_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -171,6 +178,29 @@ where
             let result = manager.list()?;
             let _ = args.json;
             render(output, true, &result)
+        }
+        Some(Commands::Clear(args)) => {
+            let manager = WorkspaceManager::new(args.base_dir.unwrap_or(default_base_dir()?));
+            let preview = manager.clear_preview()?;
+            render_clear_preview(output, &preview)?;
+
+            let confirmed = prompt_for_clear_confirmation(input, output)?;
+            writeln!(output)?;
+            if !confirmed {
+                writeln!(output, "Clear cancelled.")
+                    .context("failed to write clear cancellation output")?;
+                return Ok(());
+            }
+
+            let result = manager.clear()?;
+            render(output, true, &result)?;
+            if !result.failed_workspaces.is_empty() {
+                bail!(
+                    "failed to clear {} workspace(s)",
+                    result.failed_workspaces.len()
+                );
+            }
+            Ok(())
         }
         Some(Commands::Cwd(args)) => {
             let manager = WorkspaceManager::new(args.base_dir.unwrap_or(default_base_dir()?));
@@ -379,6 +409,50 @@ fn resolve_branch_action(
     prompt_for_branch_action(&args.workspace, input, output)
 }
 
+fn render_clear_preview(output: &mut dyn Write, preview: &ClearWorkspacesPreview) -> Result<()> {
+    writeln!(output, "The following tracked spaces will be cleared:")
+        .context("failed to write clear preview heading")?;
+
+    for workspace in &preview.workspaces {
+        writeln!(output, "Workspace: {}", workspace.workspace_name)?;
+        writeln!(output, "  Branch: {}", workspace.branch_name)?;
+        writeln!(output, "  Directory: {}", workspace.workspace_dir.display())?;
+
+        for repo in &workspace.repos {
+            writeln!(output, "  Repo: {}", repo.repo_name)?;
+            writeln!(output, "    Source: {}", repo.source_repo_path.display())?;
+            writeln!(output, "    Worktree: {}", repo.worktree_path.display())?;
+            writeln!(
+                output,
+                "    Delete branch: {} in {}",
+                workspace.branch_name,
+                repo.source_repo_path.display()
+            )?;
+        }
+
+        writeln!(output)?;
+    }
+
+    writeln!(
+        output,
+        "Totals: {} workspaces, {} worktrees, {} branch deletions",
+        preview.workspace_count, preview.worktree_count, preview.branch_deletion_count
+    )
+    .context("failed to write clear preview totals")
+}
+
+fn prompt_for_clear_confirmation(input: &mut dyn BufRead, output: &mut dyn Write) -> Result<bool> {
+    write!(
+        output,
+        "Type 'y' to clear all tracked spaces and delete their local branches: "
+    )?;
+    output.flush()?;
+
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim() == "y")
+}
+
 fn render<T>(output: &mut dyn Write, json: bool, value: &T) -> Result<()>
 where
     T: Serialize + std::fmt::Debug,
@@ -397,6 +471,7 @@ where
 mod tests {
     use super::{run_from, run_from_with_selector, Cli};
     use crate::app::{CreateWorkspaceRequest, WorkspaceManager};
+    use crate::git;
     use crate::registry::{Registry, RegistryStore, WorkspaceRecord};
     use anyhow::Context;
     use anyhow::Result;
@@ -477,6 +552,128 @@ mod tests {
         let workspaces = value["workspaces"].as_array().expect("workspaces array");
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0]["workspace_name"], "steady-trail");
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_confirms_with_exact_y_and_clears_all_workspaces() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let repo_one = fs::canonicalize(init_repo(temp.path(), "alpha")?)?;
+        let repo_two = init_repo(temp.path(), "beta")?;
+        let manager = WorkspaceManager::new(base_dir.clone());
+
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("amber-anchor".into()),
+            branch_name: None,
+            repo_paths: vec![repo_one.clone()],
+        })?;
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_two.clone()],
+        })?;
+
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "clear",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let output_text = String::from_utf8(output)?;
+        assert!(output_text.contains("Workspace: amber-anchor"));
+        assert!(output_text.contains("Branch: amber-anchor"));
+        assert!(output_text.contains(&format!("Source: {}", repo_one.display())));
+        assert!(output_text.contains(&format!(
+            "Worktree: {}",
+            manager
+                .base_dir()
+                .join("amber-anchor")
+                .join("alpha")
+                .display()
+        )));
+        assert!(output_text.contains("Delete branch: amber-anchor"));
+        assert!(output_text.contains("Totals: 2 workspaces, 2 worktrees, 2 branch deletions"));
+
+        let value = parse_clear_summary(&output_text)?;
+        assert_eq!(value["attempted_workspace_count"], 2);
+        assert_eq!(value["removed_worktree_count"], 2);
+        assert!(value["failed_workspaces"]
+            .as_array()
+            .expect("failed workspaces array")
+            .is_empty());
+
+        assert!(manager.list()?.workspaces.is_empty());
+        assert!(!git::local_branch_exists(&repo_one, "amber-anchor")?);
+        assert!(!git::local_branch_exists(&repo_two, "steady-trail")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_cancels_without_mutation_on_non_y_input() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let repo_path = init_repo(temp.path(), "alpha")?;
+        let manager = WorkspaceManager::new(base_dir.clone());
+
+        manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_path.clone()],
+        })?;
+
+        let mut input = Cursor::new(b"yes\n".to_vec());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "clear",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let output_text = String::from_utf8(output)?;
+        assert!(output_text.contains("Workspace: steady-trail"));
+        assert!(output_text.contains("Type 'y' to clear all tracked spaces"));
+        assert!(output_text.contains("Clear cancelled."));
+        assert_eq!(manager.list()?.workspaces.len(), 1);
+        assert!(git::local_branch_exists(&repo_path, "steady-trail")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_errors_when_no_workspaces_are_tracked() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::new();
+        let error = run_from(
+            [
+                "spaces",
+                "clear",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )
+        .expect_err("empty registry should fail");
+
+        assert!(error.to_string().contains("no workspaces are tracked"));
 
         Ok(())
     }
@@ -1185,6 +1382,13 @@ mod tests {
 
     fn path_to_string(path: PathBuf) -> String {
         path.to_str().expect("utf-8 path").to_owned()
+    }
+
+    fn parse_clear_summary(output: &str) -> Result<Value> {
+        let start = output
+            .find("{\n  \"registry_path\"")
+            .context("clear output did not include a JSON summary")?;
+        serde_json::from_str(&output[start..]).context("failed to parse clear JSON summary")
     }
 
     fn init_repo(base_dir: &Path, name: &str) -> Result<PathBuf> {

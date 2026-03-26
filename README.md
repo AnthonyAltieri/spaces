@@ -227,6 +227,16 @@ spaces remove spring-rollout --yes --delete-branches
 
 If neither branch flag is provided, `remove` prompts interactively.
 
+### Clear
+
+Remove every tracked workspace, delete each workspace branch from its source repositories, and require an exact lowercase `y` before any destructive work begins:
+
+```bash
+spaces clear
+```
+
+Before clearing anything, `clear` prints all tracked workspaces, their worktrees, and the branches it will delete. Any answer other than exact lowercase `y` cancels the command without making changes.
+
 ## Architecture Decisions
 
 ### 1. Shell Out To Git Instead Of Reimplementing Git Behavior
