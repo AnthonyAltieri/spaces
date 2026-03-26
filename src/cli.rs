@@ -33,6 +33,7 @@ enum Commands {
     List(ListArgs),
     Cwd(CwdArgs),
     Show(ShowArgs),
+    #[command(alias = "rm")]
     Remove(RemoveArgs),
 }
 
@@ -476,6 +477,44 @@ mod tests {
         let workspaces = value["workspaces"].as_array().expect("workspaces array");
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0]["workspace_name"], "steady-trail");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rm_alias_removes_a_workspace() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let repo_path = init_repo(temp.path(), "alpha")?;
+        let manager = WorkspaceManager::new(base_dir.clone());
+
+        let created = manager.create(CreateWorkspaceRequest {
+            workspace_name: Some("steady-trail".into()),
+            branch_name: None,
+            repo_paths: vec![repo_path],
+        })?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "rm",
+                "steady-trail",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+                "--yes",
+                "--keep-branches",
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let value: Value = serde_json::from_slice(&output)?;
+        assert_eq!(value["workspace_name"], "steady-trail");
+        assert_eq!(value["branch_action"], "keep");
+        assert!(!created.workspace_dir.exists());
+        assert!(manager.list()?.workspaces.is_empty());
 
         Ok(())
     }
